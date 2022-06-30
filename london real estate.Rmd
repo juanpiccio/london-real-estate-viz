@@ -1,0 +1,699 @@
+---
+title: "Data Visualization in R - Juan Picciotti"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Basic modules
+```{r, results='hide', message=FALSE, warning=FALSE}
+library(caret)
+library(FNN)
+library(foreign)
+library(pracma)
+library(pROC)
+library(rminer)
+library(stepPlr)
+library(nnet)
+library(ltm)
+library(glmnet)
+library(plyr)
+library(kernlab)
+library(ggplot2)
+library(scales)
+library(zoo)
+library(lubridate)
+library(chron)
+library(stats)
+library(shiny)
+library(sp)
+library(leaflet)
+library(RColorBrewer)
+library(dplyr)
+library(rgdal)
+library(maptools)
+library(plotly)
+library(reshape2)
+library(maps)
+library(viridis)
+library(raster)
+library(sf)
+```
+
+# 0. Load the data:
+
+```{r}
+path <- "/Users/juanpicciotti/BSE/2term/Visualization/Project/"
+
+lite <- "ppdata_lite.csv"
+postcodes <- "ukpostcodes.csv"
+
+data <- read.csv(paste(path, lite, sep =""))
+data %>% head(10)
+
+pc <- read.csv(paste(path, postcodes, sep =""))
+pc %>% head(5)
+```
+
+
+
+# 1. Task A:
+
+## A1. For the 33 London boroughs create a box-plot (or several box-plots) that compares house prices between the boroughs. Can you think of a better way to compare borough house prices (please demonstrate)?
+
+First, we filter the data to get the boroughs. We should get 33 unique values:
+
+```{r}
+london <- filter(data, county == "GREATER LONDON")
+unique(london$district)
+```
+
+Preliminary plotting and the summary function show that the prices have major outliers, with at least one house being sold for 1 pound and one for 97 million:
+
+```{r}
+summary(london$price)
+dim(filter(london, price <=400000))[1]/dim(london)[1]
+```
+
+In order to be able to extract meaningful insights from the data, we thought of two charts:
+
+- One showing the required box-plot, but limited to a maximum price of 400.000 pounds. This encapsulates 83.7% of all transactions.
+
+```{r}
+ggplot(london, aes(x= reorder(district, desc(district)), y= price/1000, fill=district)) +
+  geom_boxplot(size = 0.2)  +
+  ggtitle("London Boroughs and Price") + 
+  scale_x_discrete(name ="District") +
+  labs(y= "Price in thousands") +
+  
+  ylim(c(0, 400)) +
+  theme(axis.line = element_line(colour = "darkblue", size = 1, linetype = "solid"), 
+        text = element_text(size=8), plot.title = element_text(hjust = 0.5, size="14"),
+        axis.title.x = element_text(size="12"),
+        axis.title.y = element_text(size="12"), 
+        axis.text.x = element_text(face="bold"),
+        axis.text.y = element_text(),
+        panel.background = element_blank(), legend.position="none") +
+        
+  coord_flip()
+```
+
+- Another showing the outliers for each borough. Westminster seems to have quite expensive properties.
+
+```{r}
+ggplot(london, aes(x= reorder(district, desc(district)), y= price/1000000, col=district)) +
+  geom_jitter(size = 1.2)  +
+  ggtitle("London Boroughs and Price") + 
+  scale_x_discrete(name ="District") +
+  labs(y= "Price in millions") +
+  
+  ylim(c(0, 100)) +
+  theme(axis.line = element_line(colour = "darkblue", size = 1, linetype = "solid"), 
+        text = element_text(size=8), plot.title = element_text(hjust = 0.5, size="14"),
+        axis.title.x = element_text(size="12"),
+        axis.title.y = element_text(size="12"), 
+        axis.text.x = element_text(face="bold"),
+        axis.text.y = element_text(),
+        panel.background = element_blank(), legend.position="none") +
+        
+  coord_flip()
+```
+
+
+## A2. Could the entire dataset be used to estimate the relationship between price of flats and floor level? If yes, how would you show that relationship in a plot?
+
+Since we know the property types (D = Detached, S = Semi-Detached, T = Terraced, F = Flats/Maisonettes, O = Other), we could compare among the different types to try to answer this question.
+
+Nonetheless, this approach would be prone to large errors since the type "Flats/Maisonettes" does not necessarily imply above ground level.
+
+Moreover, if we filter by type of property to leave only Flats/Maisonettes and get the value counts:
+
+```{r}
+filter(data, property_type == "F")$SAON %>%
+  table() %>% 
+    as.data.frame() %>% 
+      arrange(desc(Freq)) %>% 
+        head(20)
+```
+We observe that:
+
+- Most of the times (200.615), the field has no data on what the floor is.
+- On some occasions, the data is ambiguous: does "FLAT 11" mean it's the flat "1" on the 1st floor? Or does it mean that it is the 11th flat on the ground floor?
+
+Despite the previous two points, some of the entries do offer enough information in order to infer the floor. We create a function that tries to capture this. It scans the strings in the SAON column and returns a number if the terms "ground" (0), "first" (1), etc. are in it.
+
+```{r}
+get_floor <- function(text) {
+  if (grepl("BASEMENT", text, fixed = TRUE) == TRUE) {
+    x <- -1
+} else if (grepl("GROUND", text, fixed = TRUE) == TRUE) {
+    x <- 0
+} else if (grepl("FIRST", text, fixed = TRUE) == TRUE) {
+    x <- 1
+} else if (grepl("SECOND", text, fixed = TRUE) == TRUE) {
+    x <- 2
+} else if (grepl("THIRD", text, fixed = TRUE) == TRUE) {
+    x <- 3
+} else if (grepl("FOURTH", text, fixed = TRUE) == TRUE) {
+    x <- 4
+} else if (grepl("FIFTH", text, fixed = TRUE) == TRUE) {
+    x <- 5
+} else if (grepl("SIXTH", text, fixed = TRUE) == TRUE) {
+    x <- 6
+} else if (grepl("SEVENTH", text, fixed = TRUE) == TRUE) {
+    x <- 7
+} else if (grepl("EIGTH", text, fixed = TRUE) == TRUE) {
+    x <- 8
+} else {
+    x <- NA
+}
+  return(x)
+}
+# for example:
+get_floor("test absSECOND-sa asda") # this returns a "2"
+```
+
+We create a new column "FLOOR" by applying our function:
+
+```{r}
+data$FLOOR <- apply(data["SAON"], 1, get_floor)
+head(data, 5)
+```
+
+At this point, we have 451.116 transactions for Flats/Maisonettes and data on floors for only 11.915 (2.6%) of the cases. This might not be enough to draw super robust conclusions, but should offer some insight on the matter.
+
+```{r}
+dim(filter(data, property_type == "F"))[1]
+length(which(!is.na(data$FLOOR)))
+length(which(!is.na(data$FLOOR)))/dim(filter(data, property_type == "F"))[1]
+```
+
+This is the distribution of the data on floors:
+
+```{r}
+data$FLOOR %>%
+  table() %>% 
+    as.data.frame() %>% 
+      arrange(desc(Freq))
+```
+
+Considering only Flats/Maisonettes and only those that have data on which floor they are located in, we get the following price distributions:
+
+```{r}
+filter(data, !is.na(FLOOR) & FLOOR <7) %>% # we remove the 7th floor because they are too few and introduce much variance
+  ggplot(aes(x = factor(FLOOR), y = price/1000, fill = factor(FLOOR))) +
+    geom_violin(width = 1, draw_quantiles = c(0.25, 0.5, 0.75))  +
+    ggtitle("Price of Flat/Maisonette depending on what floor it is in") + 
+    scale_x_discrete(name ="Floor level") +
+    labs(y= "Price in thousands") +
+    
+    ylim(c(0, 1000)) +
+    theme(axis.line = element_line(colour = "darkblue", size = 1, linetype = "solid"), 
+          text = element_text(size=12), plot.title = element_text(hjust = 0.5, size="14"),
+          axis.title.x = element_text(size="12"),
+          axis.title.y = element_text(size="12"), 
+          axis.text.x = element_text(face="bold"),
+          axis.text.y = element_text(),
+          panel.background = element_blank(), legend.position="none") +
+          
+    coord_flip() +
+  
+  stat_summary(fun.y=mean, geom="point", shape=4, size=2, color = "black")
+
+```
+
+The vertical lines are the 25th, 50th (median) and 75th quartiles. The crosses are the mean prices.
+
+We observe that there seems to be a trend towards higher prices as the Floor Level increases. There aren't as many transactions for higher floors as there are for lower ones, so the range of prices is smaller (no long tails).
+
+
+# 2. Task B:
+
+## B1. Create a GeoJSON file where each postcode is represented with a latitude, longitude value, together with minimum, maximum, mean and median house price.
+
+We first merge the two main dataframes by postcode:
+
+```{r}
+data_pc <- merge(data, pc, by="postcode") 
+head(data_pc,5)
+```
+
+We pass it to a group_by function with which we get all the variables required.
+
+```{r}
+to_geojson <- data_pc %>%
+  
+              group_by(postcode) %>% 
+                dplyr::summarise(
+                latitude = mean(latitude),
+                longitude = mean(longitude),
+                minimum = min(price),
+                maximum = max(price),
+                mean = mean(price),
+                median = median(price))
+
+head(to_geojson, 8)
+```
+
+We store it under a different name for future use:
+
+```{r}
+# save object for the future:
+points_data <- to_geojson
+```
+
+We add the coordinates and pass the object to the GDAL function "writeOGR" to generate the GeoJSON:
+
+```{r}
+coordinates(to_geojson) <- c("latitude", "longitude")
+rgdal::writeOGR(to_geojson, "data_2.geojson", layer = "postcodes", driver = "GeoJSON")            
+```
+
+
+## B2. Open the GeoJSON file in the GIS application of your choice and colour-code the data to give an overview of areas with high, medium and low median house price. Additionally, you can visualise this information as cloropleths or use shiny and add the information as markers on a map for a more interactive and impressive result.
+
+Reading the geojson could be done by running the following code. We will skip this step because it takes a really long while for R to read the file. Instead, we will work with the dataframe that gives origin to it.
+
+```{r}
+#library(geojsonio)
+#spdf <- geojson_read("data.geojson")
+```
+
+In the following chunk, we get the shapefile of the UK with its boundaries, and we use the data from the previous point to augment it:
+
+```{r}
+# get shapefile of UK:
+UK <- getData("GADM", country="GBR", level=2)
+UK <- st_as_sf(UK)
+
+# transform to sf object:
+points <- st_as_sf(points_data, coords = c("longitude","latitude"))
+
+# set projections:
+st_crs(UK) <- 4326
+st_crs(points) <- 4326
+
+# spatial join:
+joint_data <- st_join(points, UK)
+
+# subset for faster computing:
+subset <- dplyr::select(joint_data, c("postcode", "NAME_2"))
+
+# merges and renaming columns:
+df1 <- merge(points_data, subset, by = "postcode")
+df1$geometry <- NULL
+df2 <- df1 %>% dplyr::group_by(NAME_2) %>%
+        summarise(median_price = mean(median),
+                  mean_price = mean(mean),
+                  .groups = 'drop')
+df2$id <- df2$NAME_2
+df2$NAME_2 <- NULL
+
+# non sf object:
+df3 <- getData("GADM", country="GBR", level=2)
+df3 <- fortify(df3, region = "NAME_2" )
+
+# assign price = 0 to areas with no data:
+a <- c(setdiff(unique(df3$id), df2$id))
+b <- rep(0, length(a))
+c <- rep(0, length(a))
+df4 <- data.frame(a, b, c)
+names(df4) <- c("id", "median_price", "mean_price")
+df5 <- rbind(df2, df4)
+
+final <- merge(df3, df5)
+```
+
+We plot the results:
+
+```{r}
+ggplot()+
+  geom_polygon(data = final, aes(x = long, y = lat, group = group, fill = median_price), color="white", size=0.2) +
+  xlim(-6.3, 2)+ ylim(49.9, 56) + 
+  scale_fill_viridis_c(labels = scales::label_comma()) + #scale_fill_gradient(low="blue", high="red") 
+  coord_equal() + 
+  ggtitle("Property Prices in the UK") +
+  labs(y = "Latitude", x = "Longitude", fill = "Median Price [£]") +
+  theme_minimal()
+```
+
+Properties near London are the most expensive.
+
+
+## B3. Instead of using median price, you could have been asked to colour-code the mean house price. Would that have given a better view of the house prices across the UK? Please justify your answer.
+
+It doesn't seem to be the case that analyzing the prices considering the mean instead of the median offers different results. The plots are practically the same.
+
+```{r}
+ggplot()+
+  geom_polygon(data = final, aes(x = long, y = lat, group = group, fill = mean_price), color="white", size=0.2) +
+  xlim(-6.3, 2)+ ylim(49.9, 56) + 
+  scale_fill_viridis_c(labels = scales::label_comma()) + #scale_fill_gradient(low="blue", high="red") 
+  coord_equal() + 
+  ggtitle("Property Prices in the UK") +
+  labs(y = "Latitude", x = "Longitude", fill = "Mean Price [£]") +
+  theme_minimal()
+```
+
+A more thorough approach is the following:
+
+```{r}
+final %>% group_by(id) %>% summarize(median = mean(median_price), mean = mean(mean_price), ratio = mean(median_price)/mean(mean_price) ) %>% filter(!is.na(ratio)) %>% 
+  ggplot(aes(x = ratio)) + 
+  geom_histogram(color="darkblue", fill="lightblue") + 
+  theme_minimal() + 
+  ggtitle("Ratio of Median over Mean") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+The histogram shows the ratio between the median and the mean for each area. We see that the values are very close to 1 in all the cases, so they are basically the same. However, the median is generally slightly lower than the mean.
+
+# 3.Task C:
+
+## C1. Examine the house prices for 2015. How do these change over time? Do property prices seem to increase or decrease throughout the year?
+
+We generate a plot to answer this question:
+
+```{r}
+# transform date columns to Date object:
+data$date_of_transfer <- as.Date(data$date_of_transfer)
+# filter the data by date:
+filter(data, date_of_transfer >= "2015-01-01" & date_of_transfer <= "2015-12-31") %>%
+  
+  # order it by date:
+  arrange(-desc(date_of_transfer)) %>%
+  
+    # keep only the relevant columns:
+    dplyr::select(c("price", "date_of_transfer"))  %>% 
+  
+      # group by date and summarize mean and median:
+      dplyr::group_by(date_of_transfer) %>%
+        summarise(mean_price = mean(price),
+                  median_price = median(price),
+                  .groups = 'drop')   %>% 
+  
+          # melt the data in order to get nice colors in the plot:
+          melt(id = "date_of_transfer") %>%
+          
+            # plot:
+            ggplot(aes(x = date_of_transfer, y = value/1000, color = variable)) + 
+              geom_line() + 
+              geom_smooth() +
+              guides(color = guide_legend(title = "Variable of Analysis")) +
+              scale_color_discrete(labels = c("Mean Price", "Median Price")) +
+        
+              ggtitle("Evolution of Prices during 2015") +  
+              theme_classic() +
+              scale_color_brewer(palette="Pastel1") +
+              
+              labs(x = "Date", y= "Price in thousands") +
+              ylim(100, 400)
+```
+Looking at the smoothed mean and median, the prices seem to increase throughout the year.
+
+
+## C2. Is there a significant relationship between the price of a property and the time of year it is sold?
+
+First, we create a new column with the month of the transaction and we generate a variable with the data we need:
+
+```{r}
+data$month <- month(data$date_of_transfer)
+c2 <- dplyr::select(data, c("price", "month")) %>% group_by(month) %>%
+                   summarise(mean_price = mean(price),
+                             median_price = median(price),
+                             .groups = 'drop')   
+```
+
+Secondly, we generate polar variables:
+
+- "r" goes along the radial axis.
+- "theta" along the angular one.
+
+```{r}
+# mean
+r1 <- c()
+theta1 <- c()
+for(i in c2$mean_price) { 
+  r1 <- c(r1, 0)
+  r1 <- c(r1, i)
+  r1 <- c(r1, i)
+  r1 <- c(r1, 0)
+}
+
+# median
+r2 <- c()
+theta1 <- c()
+for(i in c2$median_price) { 
+  r2 <- c(r2, 0)
+  r2 <- c(r2, i)
+  r2 <- c(r2, i)
+  r2 <- c(r2, 0)
+}
+# thetas
+for(i in 0:11) { 
+  theta1 <- c(theta1, 0)
+  theta1 <- c(theta1, 360*i/12-10)
+  theta1 <- c(theta1, 360*i/12+10)
+  theta1 <- c(theta1, 0)
+}
+```
+
+We divide the data into 2 groups: the cheap months and the expensive ones:
+
+```{r}
+r1_cheap <- r1[5:20]
+r1_exp <- c(r1[1:4], r1[21:48])
+r2_cheap <-r2[5:20]
+r2_exp <- c(r2[1:4], r2[21:48])
+theta_cheap <-theta1[5:20]
+theta_exp <-c(theta1[1:4], theta1[21:48])
+```
+
+We generate a polar chart from plotly for the mean price of each month:
+
+```{r}
+plot_ly(type = 'scatterpolar', mode = 'lines') %>%
+  
+  # add the cheap "columns":
+  add_trace(r = ~r1_cheap,
+            theta = ~theta_cheap,
+            fill = 'toself',
+            fillcolor = "#228B22",
+            opacity = 0.5,
+            line = list(color = 'black'),
+            name = "Cheaper Months: February to May") %>%
+  
+  # add the expensive "columns":
+  add_trace(r = ~r1_exp,
+            theta = ~theta_exp,
+            fill = 'toself',
+            fillcolor = '#709Bff',
+            opacity = 0.5,
+            line = list(color = 'black'),
+            name = "More Expensive Months: June to January") %>%
+  
+  # add titles, define range, and other options:
+  layout(
+    polar = list(
+      radialaxis = list(
+        title = list(
+          text = ".                Mean Prices",
+          font = list(size = 18, color = "purple")),
+        visible = T,
+        range = c(120000,180000),
+       tickfont = list(family = "Arial Black")),
+      angularaxis = list(
+        linecolor = "#333",
+        direction = "clockwise",
+        tickmode = "array",
+        tickvals = seq(0, 330, 30),
+        ticktext = c("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"),
+        visible = T
+      )
+    ),
+    showlegend = T
+  )
+```
+
+We do the same for the medians of each month:
+
+```{r}
+plot_ly(type = 'scatterpolar', mode = 'lines') %>%
+  add_trace(r = ~r2_cheap,
+            theta = ~theta_cheap,
+            fill = 'toself',
+            fillcolor = "#228B22", #BA4A4B', #'#709Bff',
+            opacity = 0.5,
+            line = list(color = 'black'),
+            name = "Cheaper Months: February to May") %>%
+  add_trace(r = ~r2_exp,
+            theta = ~theta_exp,
+            fill = 'toself',
+            fillcolor = '#709Bff',
+            opacity = 0.5,
+            line = list(color = 'black'),
+            name = "More Expensive Months: June to January") %>%
+  layout(
+    polar = list(
+      radialaxis = list(
+        title = list(
+          text = ".           Median Prices",
+          font = list(size = 18, color = "purple")),
+        visible = T,
+        range = c(115000,135000),
+        tickfont = list(family = "Arial Black")),
+      angularaxis = list(
+        linecolor = "#333",
+        direction = "clockwise",
+        tickmode = "array",
+        tickvals = seq(0, 330, 30),
+        ticktext = c("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"),
+        visible = T
+      )
+    ),
+    showlegend = T
+  )
+```
+
+The suggestion is to buy properties from February to May, and sell them from June to January.
+
+
+## C2. Does this vary with type of property?
+
+Yes, it does, significantly.
+
+First, we create 5 variables, each associated with one type of property and containing data on the mean and the median of the price of the transactions, grouped by month:
+
+```{r}
+c2 <- data %>% dplyr::select(price, month, property_type)
+
+detached <- filter(c2, property_type == "D") %>% group_by(month) %>%
+                   summarise(mean_price = mean(price),
+                             median_price = median(price),
+                             .groups = 'drop')   
+semidetached <- filter(c2, property_type == "S") %>% group_by(month) %>%
+                   summarise(mean_price = mean(price),
+                             median_price = median(price),
+                             .groups = 'drop')   
+terraced <- filter(c2, property_type == "T") %>% group_by(month) %>%
+                   summarise(mean_price = mean(price),
+                             median_price = median(price),
+                             .groups = 'drop')   
+flats <- filter(c2, property_type == "F") %>% group_by(month) %>%
+                   summarise(mean_price = mean(price),
+                             median_price = median(price),
+                             .groups = 'drop')   
+others <- filter(c2, property_type == "O") %>% group_by(month) %>%
+                   summarise(mean_price = mean(price),
+                             median_price = median(price),
+                             .groups = 'drop')   
+```
+
+Each type of property is sold at quite different prices. In order to show all the cases in only one plot, we need to normalize the variables. To do that, we divide each variable by the mean price of transactions over all the data (conditioned by the type of property):
+
+```{r}
+detached$mean_price <- detached$mean_price/mean(detached$mean_price)
+detached$median_price <- detached$median_price/mean(detached$median_price)
+
+semidetached$mean_price <- semidetached$mean_price/mean(semidetached$mean_price)
+semidetached$median_price <- semidetached$median_price/mean(semidetached$median_price)
+
+terraced$mean_price <- terraced$mean_price/mean(terraced$mean_price)
+terraced$median_price <- terraced$median_price/mean(terraced$median_price)
+
+flats$mean_price <- flats$mean_price/mean(flats$mean_price)
+flats$median_price <- flats$median_price/mean(flats$median_price)
+
+others$mean_price <- others$mean_price/mean(others$mean_price)
+others$median_price <- others$median_price/mean(others$median_price)
+```
+
+We plot the results in interactive charts (please select from the drop-down menu):
+
+- In terms of means:
+
+```{r}
+plot_ly() %>%
+  
+  # the data:
+  add_trace(type = 'scatter', mode = 'lines', name = "Detached",
+            x = detached$month, y = detached$mean_price, visible=F, line = list(color = 'blue'))  %>%
+  add_trace(type = 'scatter', mode = 'lines', name = "Semi-Detached",
+            x = semidetached$month, y = semidetached$mean_price, visible=F, line = list(color = 'orange')) %>%
+  add_trace(type = 'scatter', mode = 'lines', name = "Terraced",
+            x = terraced$month, y = terraced$mean_price, visible=F, line = list(color = 'green')) %>%
+  add_trace(type = 'scatter', mode = 'lines', name = "Flats/Maisonettes",
+            x = flats$month, y = flats$mean_price, visible=F, line = list(color = 'purple')) %>%
+  add_trace(type = 'scatter', mode = 'lines', name = "Others",
+            x = others$month, y = others$mean_price, visible=F, line = list(color = 'red')) %>%
+  
+  layout(
+    
+    # dropdown menu:
+    updatemenus = list(
+      list(
+        yanchor = 'auto',
+        buttons = list(
+          list(args = list("visible", list(F, F, F, F, F)),
+               label = 'Please select one'),
+          list(args = list("visible", list(T, T, T, T, T)),
+               label = 'All'),
+          list(args = list("visible", list(T, T, T, T, F)),
+               label = 'All except Others'),
+          list(args = list("visible", list(F, F, F, F, T)),
+               label = 'Only Others')
+        ))),
+    
+    # cosmetics:    
+    title = 'Relative Prices - Means',
+    plot_bgcolor='#e5ecf6',
+    xaxis = list(title = 'Month'), 
+    yaxis = list(title = 'Price relative to year-long mean'), 
+    legend = list(title=list(text='\n<b> Type of Property </b>\n')))
+```
+
+- In terms of Medians:
+
+```{r}
+plot_ly() %>%
+  
+  # the data:
+  add_trace(type = 'scatter', mode = 'lines', name = "Detached",
+            x = detached$month, y = detached$median_price, visible=F, line = list(color = 'blue'))  %>%
+  add_trace(type = 'scatter', mode = 'lines', name = "Semi-Detached",
+            x = semidetached$month, y = semidetached$median_price, visible=F, line = list(color = 'orange')) %>%
+  add_trace(type = 'scatter', mode = 'lines', name = "Terraced",
+            x = terraced$month, y = terraced$median_price, visible=F, line = list(color = 'green')) %>%
+  add_trace(type = 'scatter', mode = 'lines', name = "Flats/Maisonettes",
+            x = flats$month, y = flats$median_price, visible=F, line = list(color = 'purple')) %>%
+  add_trace(type = 'scatter', mode = 'lines', name = "Others",
+            x = others$month, y = others$median_price, visible=F, line = list(color = 'red')) %>%
+  
+  layout(
+    
+    # dropdown menu:
+    updatemenus = list(
+      list(
+        yanchor = 'auto',
+        buttons = list(
+          list(args = list("visible", list(F, F, F, F, F)),
+               label = 'Please select one'),
+          list(args = list("visible", list(T, T, T, T, T)),
+               label = 'All'),
+          list(args = list("visible", list(T, T, T, T, F)),
+               label = 'All except Others'),
+          list(args = list("visible", list(F, F, F, F, T)),
+               label = 'Only Others')
+        ))),
+    
+    # cosmetics:    
+    title = 'Relative Prices - Medians',
+    plot_bgcolor='#e5ecf6',
+    xaxis = list(title = 'Month'), 
+    yaxis = list(title = 'Price relative to year-long mean'), 
+    legend = list(title=list(text='\n<b> Type of Property </b>\n')))
+```
+
+The charts show that all the types of properties, except for the ones labeled as "Others", have similar behaviors and are cheaper from February to May, whereas the type "Others" has a more volatile nature.
+
+
+
